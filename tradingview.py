@@ -9,14 +9,17 @@ from uuid import uuid4
 
 import websocket
 
+from proxy_settings import websocket_options
+
 CONTRACTS = {"ES1!": "CME_MINI:ES1!", "NQ1!": "CME_MINI:NQ1!", "YM1!": "CBOT_MINI:YM1!",
              "RTY1!": "CME_MINI:RTY1!", "VX1!": "CBOE:VX1!"}
 
 
 @contextmanager
-def feed(commands):
+def feed(commands, market):
     ws = websocket.create_connection("wss://data.tradingview.com/socket.io/websocket?from=chart%2F",
-                                     origin="https://www.tradingview.com", timeout=6)
+                                     origin="https://www.tradingview.com", timeout=6,
+                                     **websocket_options(market))
     def messages():
         end = time.monotonic() + 8
         while time.monotonic() < end:
@@ -43,13 +46,13 @@ def feed(commands):
         ws.close()
 
 
-def quote_fields(ticker):
+def quote_fields(ticker, market="US"):
     session = "qs_" + uuid4().hex[:12]
     fields = {}
     commands = [("quote_create_session", [session]),
                 ("quote_set_fields", [session, "lp", "lp_time", "prev_close_price", "currency_code", "description"]),
                 ("quote_add_symbols", [session, ticker])]
-    with feed(commands) as stream:
+    with feed(commands, market) as stream:
         for method, params in stream:
             if method == "qsd" and params[0] == session and params[1].get("n") == ticker:
                 fields.update(params[1].get("v") or {})
@@ -60,7 +63,7 @@ def quote_fields(ticker):
     return fields
 
 
-def series(ticker, period, session_name, count):
+def series(ticker, period, session_name, count, market="US"):
     session = "cs_" + uuid4().hex[:12]
     spec = "=" + json.dumps({"symbol": ticker, "session": session_name, "adjustment": "splits"})
     commands = [("chart_create_session", [session, ""]),
@@ -68,7 +71,7 @@ def series(ticker, period, session_name, count):
                 ("create_series", [session, "s1", "s1", "symbol_1", period, count, ""])]
     values = {}
     metadata = {}
-    with feed(commands) as stream:
+    with feed(commands, market) as stream:
         for method, params in stream:
             if method == "symbol_resolved" and params[0] == session:
                 metadata = params[2]

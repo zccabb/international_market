@@ -6,6 +6,9 @@ from zoneinfo import ZoneInfo
 
 import requests
 import websocket
+from python_socks import ProxyError
+
+from proxy_settings import http_session
 
 from tradingview import CHICAGO, CONTRACTS, quote_fields, series, trading_sessions
 
@@ -130,14 +133,14 @@ def local_quote(client, market, symbol):
                     entry["name"], q["currency"], "Yahoo 台湾")
 
 
-def tv_quote(ticker):
-    fields = quote_fields(ticker)
+def tv_quote(ticker, market):
+    fields = quote_fields(ticker, market)
     return snapshot(fields["lp"], fields.get("prev_close_price"), fields["lp_time"],
                     fields.get("description"), fields.get("currency_code") or "USD", "TradingView")
 
 
-def tv_candles(ticker, interval, session, count):
-    raw, metadata = series(ticker, "1" if interval == "1m" else "1D", session, count)
+def tv_candles(ticker, interval, session, count, market):
+    raw, metadata = series(ticker, "1" if interval == "1m" else "1D", session, count, market)
     sessions = []
     if interval == "1d":
         first = datetime.fromtimestamp(raw[0][0], CHICAGO).date()
@@ -158,18 +161,18 @@ def tv_candles(ticker, interval, session, count):
     return list(rows.values())
 
 
-TV_ERRORS = (websocket.WebSocketException, OSError, ValueError, KeyError, IndexError, TypeError)
+TV_ERRORS = (websocket.WebSocketException, ProxyError, OSError, ValueError, KeyError, IndexError, TypeError)
 
 
 def continuous_contract(symbol, daily):
     ticker = CONTRACTS[symbol]
     candles, issues, quote = [], [], None
     try:
-        quote = tv_quote(ticker)
+        quote = tv_quote(ticker, "FUTURES")
     except TV_ERRORS:
         pass
     try:
-        candles = tv_candles(ticker, "1m", "regular", 500)
+        candles = tv_candles(ticker, "1m", "regular", 500, "FUTURES")
         last = candles[-1]
         if not quote or last["stamp"] > quote["asof"]:
             quote = snapshot(last["close"], (quote or {}).get("previous"), last["stamp"], symbol, "USD", "TradingView 分钟成交")
@@ -177,7 +180,7 @@ def continuous_contract(symbol, daily):
         issues.append("分钟行情暂不可用")
     if daily:
         try:
-            candles.extend(tv_candles(ticker, "1d", "regular", 100))
+            candles.extend(tv_candles(ticker, "1d", "regular", 100, "FUTURES"))
         except TV_ERRORS:
             issues.append("日线暂不可用")
     return quote, candles, issues
@@ -198,13 +201,13 @@ def us_session_quote(symbol, meta, minutes, quote, issues):
     if exchange:
         ticker = exchange + ":" + symbol.replace("-", ".")
         try:
-            live = tv_quote(ticker)
+            live = tv_quote(ticker, "US")
             if live["asof"] >= quote["asof"]:
                 quote = live
         except TV_ERRORS:
             issues.append("流式报价暂不可用")
         try:
-            extended = tv_candles(ticker, "1m", "24h", 500)
+            extended = tv_candles(ticker, "1m", "24h", 500, "US")
             traded = {bar["stamp"]: bar for bar in extended if bar["volume"] and bar["volume"] > 0}
         except TV_ERRORS:
             issues.append("全时段分钟线暂不可用")
@@ -228,7 +231,7 @@ def collect(market, symbol, daily):
         return continuous_contract(symbol, daily)
     quote = None
     candles, issues = [], []
-    with requests.Session() as client:
+    with http_session(market) as client:
         client.headers["User-Agent"] = "Mozilla/5.0 (compatible; InternationalMarket/1.0)"
         if market in ("HK", "KR", "TW"):
             try:

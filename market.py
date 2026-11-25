@@ -11,6 +11,7 @@ from sqlalchemy.exc import IntegrityError
 from waitress import serve
 
 from providers import MARKETS, collect, normalize_symbol
+from proxy_settings import proxy_setting
 from store import EXAMPLES, Store, database_url
 
 
@@ -120,6 +121,11 @@ def main():
     args = parser.parse_args()
     if not 1 <= args.port <= 65535 or args.interval < 10:
         parser.error("端口必须是 1–65535，采集间隔至少为 10 秒")
+    try:
+        for market in MARKETS:
+            proxy_setting(market)
+    except ValueError as exc:
+        parser.error(str(exc))
     app = create_app()
     worker = Collector(app.extensions["store"], args.interval)
     app.extensions["collector"] = worker

@@ -40,6 +40,28 @@ python3 -m venv .venv
 
 公开接口的延迟、可用时段和历史范围取决于市场与标的。Yahoo Finance 初始请求当前可用的一天分钟线和一个月日线，之后逐轮累积。台股使用台湾接口返回的可用区间。TradingView 连续期货按交易所时段和假期修正划分日线交易日。图表显示各源返回的 OHLC，未做跨源复权。美股扩展时段使用有成交量的分钟收盘价；缺少新成交时保留最近行情及其原时间。港韩台的首选报价不可用时尝试 Yahoo 图表快照，页面显示实际报价源。部分数据失败时保留上次成功的数据，并在清单标记受影响的部分。
 
+## 采集代理
+
+代理是可选项，使用者自行提供地址。行情 HTTP 请求、备用数据源和 TradingView WebSocket 均使用所属市场的策略。默认 `system` 跟随系统代理设置，包括 `HTTPS_PROXY`、`ALL_PROXY` 和 `NO_PROXY`。
+
+| 设置 | 作用 |
+| --- | --- |
+| `MARKET_PROXY` | 全局策略。可以填 `system`、`direct`（强制直连），或一个自有代理 URL |
+| `MARKET_PROXY_<市场>` | 覆盖该市场的全局策略。市场可取 `US`、`HK`、`JP`、`KR`、`TW`、`INDEX`、`FUTURES` |
+
+例如在 PowerShell 中让美股和期货使用你本机已运行的代理，其余市场直连。示例端口需要替换为你自己的监听端口。
+
+```powershell
+$env:MARKET_PROXY = "direct"
+$env:MARKET_PROXY_US = "http://127.0.0.1:7890"
+$env:MARKET_PROXY_FUTURES = $env:MARKET_PROXY_US
+.\.venv\Scripts\python market.py
+```
+
+也可以把代理 URL 放在 `MARKET_PROXY`，单独设置 `MARKET_PROXY_HK=direct` 等例外。macOS / Linux 使用同名环境变量和 `export`。支持 HTTP CONNECT、SOCKS5（`socks5://`）和代理端解析域名的 SOCKS5（`socks5h://`）。需要认证时可以在本机环境变量中使用 `协议://用户名:密码@主机:端口`，用户名和密码里的特殊字符须进行 URL 编码。
+
+修改后重启采集器生效。显式指定的代理连接失败时，该轮请求记为失败，后备数据源仍执行同一策略。看板和数据库连接不经过采集代理。仓库不含代理池、订阅或代理凭据。
+
 ## 存储
 
 默认数据库在启动目录的 `data/market.sqlite3`。设置 `MARKET_SQLITE_PATH` 可以指定其他文件位置。
