@@ -1,0 +1,32 @@
+<!doctype html>
+<html lang="zh-CN">
+<head>
+  <meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1">
+  <title>国际行情 · 自选看板</title>
+  <link rel="stylesheet" href="{{ url_for('static', filename='app.css') }}">
+  <script defer src="{{ url_for('static', filename='app.js') }}"></script>
+</head>
+<body>
+<header><div class="wrap brand"><i aria-hidden="true">▥</i><strong>国际行情</strong><span>自选看板</span><small id="connection" role="status">连接中</small></div></header>
+<main class="wrap">
+  <section class="toolbar">
+    <div><h1>行情总览</h1><p id="summary">正在读取自选清单…</p></div>
+    <form id="add-form">
+      <label>市场<select id="market">{% for code, name in markets.items() %}<option value="{{ code }}" data-example="{{ examples[code] }}">{{ name }}</option>{% endfor %}</select></label>
+      <label>证券代码<input id="symbol" required maxlength="32" autocomplete="off" placeholder="AAPL" spellcheck="false"></label>
+      <button type="submit" class="primary">＋ 添加标的</button>
+    </form>
+  </section>
+  <p id="notice" role="status" aria-live="polite"></p>
+  <section class="panel"><div class="section-head"><h2>采集清单</h2><label class="filter">筛选市场<select id="filter"><option value="">全部市场</option>{% for code, name in markets.items() %}<option value="{{ code }}">{{ name }}</option>{% endfor %}</select></label></div>
+    <div class="scroll"><table><thead><tr><th>证券 / 市场</th><th class="right">最新价</th><th class="right">涨跌幅</th><th>行情时间</th><th>数据源 / 采集状态</th><th><span class="sr">操作</span></th></tr></thead><tbody id="rows"></tbody></table></div><p id="empty" hidden>清单中暂无标的。</p>
+  </section>
+  <section class="panel detail" id="detail" hidden>
+    <div class="section-head"><div><h2 id="detail-title">价格走势</h2><p id="range"></p></div>
+      <div role="group" aria-label="行情周期" class="switch"><button data-interval="1m" aria-pressed="true">分钟线</button><button data-interval="1d" aria-pressed="false">日线</button></div></div>
+    <div class="plot"><canvas id="chart" role="img" aria-label="收盘价走势"></canvas></div><p id="bar-info" aria-live="off"></p>
+  </section>
+  <footer>价格按交易币种显示。行情时间使用浏览器本地时区，公开数据源可能延迟。</footer>
+</main>
+<dialog id="confirm"><h2>移除标的</h2><p id="confirm-text"></p><div><button id="cancel">取消</button><button class="danger" id="delete">确认移除</button></div></dialog>
+</body></html>
