@@ -10,13 +10,17 @@ from uuid import uuid4
 import websocket
 
 from proxy_settings import websocket_options
+from runtime import HostRateLimiter
 
 CONTRACTS = {"ES1!": "CME_MINI:ES1!", "NQ1!": "CME_MINI:NQ1!", "YM1!": "CBOT_MINI:YM1!",
              "RTY1!": "CME_MINI:RTY1!", "VX1!": "CBOE:VX1!"}
+TV_HOST = "data.tradingview.com"
+WS_PACER = HostRateLimiter((0.12, 0.25))
 
 
 @contextmanager
 def feed(commands, market):
+    WS_PACER.acquire(TV_HOST)
     ws = websocket.create_connection("wss://data.tradingview.com/socket.io/websocket?from=chart%2F",
                                      origin="https://www.tradingview.com", timeout=6,
                                      **websocket_options(market))

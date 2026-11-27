@@ -10,8 +10,9 @@ from flask import Flask, abort, jsonify, render_template, request
 from sqlalchemy.exc import IntegrityError
 from waitress import serve
 
-from providers import MARKETS, collect, normalize_symbol
+from providers import MARKETS, collect, normalize_symbol, prefetch_quotes
 from proxy_settings import proxy_setting
+from runtime import MicroBatchRecorder, SymbolCooldown, compute_next_due
 from store import EXAMPLES, Store, database_url
 
 
@@ -21,41 +22,94 @@ class Collector:
         self.interval = interval
         self.changed = threading.Event()
         self.closed = threading.Event()
+        self.cooldowns = SymbolCooldown()
+        self.recorder = None
         self.thread = threading.Thread(target=self.run, name="scheduler")
 
-    def fetch(self, row, daily):
-        quote, candles, issues = collect(row["market"], row["symbol"], daily)
-        self.store.record(row["id"], quote, candles, issues)
-        return any(bar["interval"] == "1d" for bar in candles)
+    def fetch(self, row, daily, prefetched_quote=None):
+        since_stamp = self.store.latest_stamp(row["id"], "1m")
+        quote, candles, issues = collect(row["market"], row["symbol"], daily,
+                                         since_stamp=since_stamp, prefetched_quote=prefetched_quote)
+        entry = (row["id"], quote, candles, issues)
+        if self.recorder is not None:
+            self.recorder.submit(entry)
+        else:
+            self.store.record(*entry)
+        has_daily = any(bar["interval"] == "1d" for bar in candles)
+        succeeded = bool(quote or candles)
+        return has_daily, succeeded
 
     def run(self):
         due, daily_due, running = {}, {}, {}
-        with ThreadPoolExecutor(max_workers=4, thread_name_prefix="quotes") as pool:
-            while not self.closed.is_set():
-                self.changed.clear()
-                now = time.monotonic()
-                try:
-                    for key, future in list(running.items()):
-                        if future.done():
-                            del running[key]
-                            due[key] = now + self.interval
-                            if future.result():
-                                daily_due[key] = now + 1800
-                    rows = self.store.list()
-                    keys = {row["id"] for row in rows}
-                    for schedule in (due, daily_due):
-                        for key in schedule.keys() - keys:
-                            del schedule[key]
-                    for row in rows:
-                        key = row["id"]
-                        if len(running) >= 4:
-                            break
-                        if key not in running and now >= due.get(key, 0):
-                            running[key] = pool.submit(self.fetch, row, now >= daily_due.get(key, 0))
-                except Exception as exc:
-                    # No connection strings, request headers or response bodies in logs.
-                    logging.warning("Collector could not complete task (%s)", type(exc).__name__)
-                self.changed.wait(1)
+        self.recorder = MicroBatchRecorder(
+            self.store.record_batch,
+            max_items=8,
+            flush_interval=0.5,
+            on_error=lambda exc: logging.warning("Collector could not save batch (%s)", type(exc).__name__),
+        )
+        try:
+            with ThreadPoolExecutor(max_workers=4, thread_name_prefix="quotes") as pool:
+                while not self.closed.is_set():
+                    self.changed.clear()
+                    now = time.monotonic()
+                    wait_seconds = 1.0
+                    try:
+                        for key, (future, started_at) in list(running.items()):
+                            if future.done():
+                                del running[key]
+                                has_daily, succeeded = future.result()
+                                if succeeded:
+                                    self.cooldowns.record_success(key)
+                                    due[key] = compute_next_due(started_at, self.interval, now)
+                                else:
+                                    backoff = self.cooldowns.record_failure(key, self.interval)
+                                    due[key] = (now + backoff) if backoff else compute_next_due(started_at, self.interval, now)
+                                if has_daily:
+                                    daily_due[key] = now + 1800
+                        rows = self.store.list()
+                        keys = {row["id"] for row in rows}
+                        self.cooldowns.forget_missing(keys)
+                        for schedule in (due, daily_due):
+                            for key in schedule.keys() - keys:
+                                del schedule[key]
+
+                        ready = [row for row in rows if row["id"] not in running and now >= due.get(row["id"], 0)]
+                        prefetched = {}
+                        for batch_market in ("HK", "TW"):
+                            batch_symbols = [r["symbol"] for r in ready if r["market"] == batch_market]
+                            if len(batch_symbols) >= 2:
+                                prefetched.update(
+                                    {(batch_market, sym): q for sym, q in prefetch_quotes(batch_market, batch_symbols).items()}
+                                )
+
+                        for row in ready:
+                            if len(running) >= 4:
+                                break
+                            key = row["id"]
+                            started = time.monotonic()
+                            fut = pool.submit(
+                                self.fetch,
+                                row,
+                                now >= daily_due.get(key, 0),
+                                prefetched.get((row["market"], row["symbol"])),
+                            )
+                            fut.add_done_callback(lambda _f: self.changed.set())
+                            running[key] = (fut, started)
+
+                        pending_dues = [due[row["id"]] for row in rows
+                                        if row["id"] not in running and row["id"] in due]
+                        if len(running) < 4 and any(row["id"] not in running and now >= due.get(row["id"], 0) for row in rows):
+                            wait_seconds = 0.05
+                        elif pending_dues:
+                            wait_seconds = max(0.05, min(1.0, min(pending_dues) - time.monotonic()))
+                    except Exception as exc:
+                        # No connection strings, request headers or response bodies in logs.
+                        logging.warning("Collector could not complete task (%s)", type(exc).__name__)
+                    self.changed.wait(wait_seconds)
+        finally:
+            recorder, self.recorder = self.recorder, None
+            if recorder is not None:
+                recorder.close()
 
 
 def create_app(url=None, seed=True):

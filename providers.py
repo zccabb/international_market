@@ -1,7 +1,9 @@
 """Public, credential-free quote and candle adapters."""
 import math
 import re
+import time
 from datetime import datetime, timedelta, timezone
+from urllib.parse import urlsplit
 from zoneinfo import ZoneInfo
 
 import requests
@@ -9,6 +11,7 @@ import websocket
 from python_socks import ProxyError
 
 from proxy_settings import http_session
+from runtime import HostRateLimiter
 
 from tradingview import CHICAGO, CONTRACTS, quote_fields, series, trading_sessions
 
@@ -19,6 +22,21 @@ PATTERNS = {"US": r"[A-Z]{1,8}(?:-[A-Z]{1,2})?", "HK": r"\d{1,5}(?:\.HK)?",
             "KR": r"\d{6}(?:\.KS|\.KQ)?", "INDEX": r"\^[A-Z0-9.-]{1,18}",
             "FUTURES": r"[A-Z0-9]{1,10}=F"}
 TW_GATEWAY = "https://tw-gw-finance.media.yahoo.com/api/v1/gql/saved_query"
+BROWSER_HEADERS = {
+    "User-Agent": ("Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
+                   "AppleWebKit/537.36 (KHTML, like Gecko) Chrome/135.0.0.0 Safari/537.36"),
+    "Accept-Encoding": "gzip, deflate",
+}
+HTTP_PACER = HostRateLimiter((0.12, 0.28))
+FULL_MINUTE_BARS = 500
+INCREMENTAL_MINUTE_BARS = 45
+INCREMENTAL_MAX_AGE = 35 * 60
+
+
+def minute_bar_count(since_stamp):
+    if since_stamp and 0 <= time.time() - int(since_stamp) <= INCREMENTAL_MAX_AGE:
+        return INCREMENTAL_MINUTE_BARS
+    return FULL_MINUTE_BARS
 
 
 def normalize_symbol(market, value):
@@ -80,8 +98,14 @@ def parse_chart(data, symbol, interval):
 
 
 def request(client, url, **kwargs):
+    host = urlsplit(url).hostname or ""
+    HTTP_PACER.acquire(host)
     r = client.get(url, timeout=(4, 8), **kwargs)
+    status = getattr(r, "status_code", 200)
+    if isinstance(status, int) and status in (429, 403):
+        HTTP_PACER.on_rate_limited(host)
     r.raise_for_status()
+    HTTP_PACER.on_success(host)
     return r
 
 
@@ -133,6 +157,50 @@ def local_quote(client, market, symbol):
                     entry["name"], q["currency"], "Yahoo 台湾")
 
 
+def prefetch_quotes(market, symbols):
+    """Batch-fetch local quotes when multiple HK or TW symbols are due together."""
+    if len(symbols) < 2 or market not in ("HK", "TW"):
+        return {}
+    results = {}
+    try:
+        with http_session(market) as client:
+            client.headers.update(BROWSER_HEADERS)
+            if market == "HK":
+                by_code = {s.split(".")[0].zfill(5): s for s in symbols}
+                query = ",".join("hk" + code for code in by_code)
+                r = request(client, "https://qt.gtimg.cn/q=" + query, headers={"Referer": "https://gu.qq.com/"})
+                for segment in r.content.decode("gb18030", errors="ignore").split(";"):
+                    if '"' not in segment:
+                        continue
+                    fields = segment.split('"')[1].split("~")
+                    if len(fields) > 30 and fields[2] in by_code:
+                        try:
+                            dt = datetime.strptime(fields[30], "%Y/%m/%d %H:%M:%S").replace(
+                                tzinfo=ZoneInfo("Asia/Hong_Kong"))
+                            results[by_code[fields[2]]] = snapshot(
+                                fields[3], fields[4], dt.timestamp(), fields[1], "HKD", "腾讯行情")
+                        except (ValueError, TypeError):
+                            continue
+            elif market == "TW":
+                for pos in range(0, len(symbols), 50):
+                    chunk = symbols[pos:pos + 50]
+                    params = dict(namespace="twfinance", version="v2", id="symbolsWithQuote",
+                                  symbols=",".join(chunk), format="true")
+                    entries = request(client, TW_GATEWAY, params=params).json()["data"]["result"]["symbols"]
+                    wanted = set(chunk)
+                    for entry in entries:
+                        sym = entry.get("id")
+                        if sym in wanted and isinstance(entry.get("quote"), dict):
+                            q = entry["quote"]
+                            try:
+                                results[sym] = snapshot(q["price"]["raw"], q["previousClose"]["raw"],
+                                                        q["marketTime"], entry.get("name"), q.get("currency"),
+                                                        "Yahoo 台湾")
+                            except (KeyError, ValueError, TypeError):
+                                continue
+    except (requests.RequestException, KeyError, IndexError, ValueError, TypeError, OSError):
+        return results
+    return results
 def tv_quote(ticker, market):
     fields = quote_fields(ticker, market)
     return snapshot(fields["lp"], fields.get("prev_close_price"), fields["lp_time"],
@@ -164,7 +232,7 @@ def tv_candles(ticker, interval, session, count, market):
 TV_ERRORS = (websocket.WebSocketException, ProxyError, OSError, ValueError, KeyError, IndexError, TypeError)
 
 
-def continuous_contract(symbol, daily):
+def continuous_contract(symbol, daily, since_stamp=None):
     ticker = CONTRACTS[symbol]
     candles, issues, quote = [], [], None
     try:
@@ -172,7 +240,7 @@ def continuous_contract(symbol, daily):
     except TV_ERRORS:
         pass
     try:
-        candles = tv_candles(ticker, "1m", "regular", 500, "FUTURES")
+        candles = tv_candles(ticker, "1m", "regular", minute_bar_count(since_stamp), "FUTURES")
         last = candles[-1]
         if not quote or last["stamp"] > quote["asof"]:
             quote = snapshot(last["close"], (quote or {}).get("previous"), last["stamp"], symbol, "USD", "TradingView 分钟成交")
@@ -194,7 +262,7 @@ def chart_quote(meta):
                     meta.get("currency"), "Yahoo Finance")
 
 
-def us_session_quote(symbol, meta, minutes, quote, issues):
+def us_session_quote(symbol, meta, minutes, quote, issues, since_stamp=None):
     exchange = {"NMS": "NASDAQ", "NGM": "NASDAQ", "NCM": "NASDAQ", "NYQ": "NYSE",
                 "PCX": "AMEX"}.get(meta.get("exchangeName"))
     traded = {}
@@ -207,7 +275,7 @@ def us_session_quote(symbol, meta, minutes, quote, issues):
         except TV_ERRORS:
             issues.append("流式报价暂不可用")
         try:
-            extended = tv_candles(ticker, "1m", "24h", 500, "US")
+            extended = tv_candles(ticker, "1m", "24h", minute_bar_count(since_stamp), "US")
             traded = {bar["stamp"]: bar for bar in extended if bar["volume"] and bar["volume"] > 0}
         except TV_ERRORS:
             issues.append("全时段分钟线暂不可用")
@@ -226,14 +294,14 @@ def us_session_quote(symbol, meta, minutes, quote, issues):
     return quote, list(combined.values())
 
 
-def collect(market, symbol, daily):
+def collect(market, symbol, daily, since_stamp=None, prefetched_quote=None):
     if market == "FUTURES" and symbol in CONTRACTS:
-        return continuous_contract(symbol, daily)
-    quote = None
+        return continuous_contract(symbol, daily, since_stamp=since_stamp)
+    quote = prefetched_quote
     candles, issues = [], []
     with http_session(market) as client:
-        client.headers["User-Agent"] = "Mozilla/5.0 (compatible; InternationalMarket/1.0)"
-        if market in ("HK", "KR", "TW"):
+        client.headers.update(BROWSER_HEADERS)
+        if quote is None and market in ("HK", "KR", "TW"):
             try:
                 quote = local_quote(client, market, symbol)
             except (requests.RequestException, KeyError, IndexError, ValueError, TypeError):
@@ -244,7 +312,7 @@ def collect(market, symbol, daily):
             if not quote:
                 quote = chart_quote(meta)
             if market == "US":
-                quote, minutes = us_session_quote(symbol, meta, minutes, quote, issues)
+                quote, minutes = us_session_quote(symbol, meta, minutes, quote, issues, since_stamp=since_stamp)
             candles.extend(minutes)
         except (requests.RequestException, ValueError, TypeError, KeyError, IndexError, OSError):
             issues.append("分钟行情暂不可用")

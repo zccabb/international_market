@@ -11,6 +11,8 @@ from sqlalchemy.dialects.sqlite import insert as sqlite_insert
 from sqlalchemy.engine import URL
 from sqlalchemy.exc import IntegrityError
 
+from runtime import CandleWatermark
+
 meta = MetaData()
 watch = Table("watchlist", meta,
               Column("id", String(32), primary_key=True),
@@ -52,6 +54,7 @@ class Store:
     def __init__(self, url):
         self.engine = create_engine(url, pool_pre_ping=True, hide_parameters=True)
         self.sqlite = self.engine.dialect.name == "sqlite"
+        self.watermarks = CandleWatermark()
         if self.sqlite:
             @event.listens_for(self.engine, "connect")
             def setup(db, _):
@@ -82,7 +85,25 @@ class Store:
 
     def remove(self, key):
         with self.engine.begin() as conn:
-            return bool(conn.execute(delete(watch).where(watch.c.id == key)).rowcount)
+            removed = bool(conn.execute(delete(watch).where(watch.c.id == key)).rowcount)
+        if removed:
+            self.watermarks.forget(key)
+        return removed
+
+    def latest_stamp(self, key, interval="1m"):
+        cached = self.watermarks.latest_stamp(key, interval)
+        if cached is not None:
+            return cached
+        with self.engine.connect() as conn:
+            stmt = (select(bars.c.stamp)
+                    .where(bars.c.item == key, bars.c.interval == interval)
+                    .order_by(bars.c.stamp.desc())
+                    .limit(1))
+            stamp = conn.scalar(stmt)
+        if stamp is not None:
+            self.watermarks.seed_latest_stamp(key, interval, int(stamp))
+            return int(stamp)
+        return None
 
     def list(self):
         with self.engine.connect() as conn:
@@ -94,24 +115,39 @@ class Store:
             return [dict(row) for row in reversed(conn.execute(stmt).mappings().all())]
 
     def record(self, key, quote, candles, issues):
+        self.record_batch([(key, quote, candles, issues)])
+
+    def record_batch(self, entries):
+        if not entries:
+            return
+        staged = [(key, quote, self.watermarks.filter_candles(key, candles), issues)
+                  for key, quote, candles, issues in entries]
+        committed = []
+        now_ts = int(time.time())
+        values = ("open", "high", "low", "close", "volume")
         with self.engine.begin() as conn:
-            # Acquire the row before saving any data. Deleting and re-adding a
-            # symbol creates a new id, so old requests cannot populate the new row.
-            where = watch.c.id == key
-            result = conn.execute(update(watch).where(where).values(checked=int(time.time()), issue=" · ".join(issues) or None))
-            if not result.rowcount:
-                return
-            if quote:
-                fresh = watch.c.asof.is_(None) | (watch.c.asof <= quote["asof"])
-                conn.execute(update(watch).where(where, fresh).values(**quote))
-            for pos in range(0, len(candles), 200):
-                rows = [dict(item=key, **bar) for bar in candles[pos:pos + 200]]
-                values = ("open", "high", "low", "close", "volume")
-                if self.sqlite:
-                    stmt = sqlite_insert(bars).values(rows)
-                    stmt = stmt.on_conflict_do_update(index_elements=["item", "interval", "stamp"],
-                                                      set_={k: stmt.excluded[k] for k in values})
-                else:
-                    stmt = mysql_insert(bars).values(rows)
-                    stmt = stmt.on_duplicate_key_update(**{k: stmt.inserted[k] for k in values})
-                conn.execute(stmt)
+            for key, quote, changed_candles, issues in staged:
+                # Acquire the row before saving any data. Deleting and re-adding a
+                # symbol creates a new id, so old requests cannot populate the new row.
+                where = watch.c.id == key
+                result = conn.execute(update(watch).where(where).values(
+                    checked=now_ts, issue=" · ".join(issues) or None))
+                if not result.rowcount:
+                    continue
+                if quote:
+                    fresh = watch.c.asof.is_(None) | (watch.c.asof <= quote["asof"])
+                    conn.execute(update(watch).where(where, fresh).values(**quote))
+                for pos in range(0, len(changed_candles), 200):
+                    rows = [dict(item=key, **bar) for bar in changed_candles[pos:pos + 200]]
+                    if self.sqlite:
+                        stmt = sqlite_insert(bars).values(rows)
+                        stmt = stmt.on_conflict_do_update(index_elements=["item", "interval", "stamp"],
+                                                          set_={k: stmt.excluded[k] for k in values})
+                    else:
+                        stmt = mysql_insert(bars).values(rows)
+                        stmt = stmt.on_duplicate_key_update(**{k: stmt.inserted[k] for k in values})
+                    conn.execute(stmt)
+                if changed_candles:
+                    committed.append((key, changed_candles))
+        for key, changed_candles in committed:
+            self.watermarks.commit_candles(key, changed_candles)
